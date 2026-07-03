@@ -1,5 +1,5 @@
 // ============================================================
-// BROILEROS v2.1 FINAL - BACKEND COMPLETE
+// BROILEROS v2.1 FINAL - BACKEND COMPLETE (Render Ready)
 // ============================================================
 require('dotenv').config();
 const express = require('express');
@@ -20,10 +20,11 @@ const JWT_SECRET = process.env.JWT_SECRET || 'broileros-super-secret-key';
 app.use(helmet());
 
 const allowedOrigins = [
-    'https://broileros-app.pages.dev', // Ganti dengan URL Cloudflare Anda
+    'https://broileros-app.pages.dev',
     'https://broileros.hemitafarm.com',
     'http://localhost:5173',
-    'http://localhost:3000'
+    'http://localhost:3000',
+    'https://broileros-backend.onrender.com' // Tambahkan domain Render Anda
 ];
 app.use(cors({
     origin: function (origin, callback) {
@@ -45,11 +46,32 @@ const loginLimiter = rateLimit({
 app.use(express.json({ limit: '10mb' }));
 
 // ============================================================
+// ROUTE KESEHATAN (DITEMPATKAN PALING ATAS UNTUK TESTING)
+// ============================================================
+app.get('/', (req, res) => {
+    res.send('BroilerOS Backend is running!');
+});
+
+app.get('/api/health', (req, res) => {
+    console.log('✅ Health route accessed at', new Date().toISOString());
+    res.json({ status: 'OK', timestamp: new Date().toISOString() });
+});
+
+// ============================================================
 // DATABASE CONNECTION
 // ============================================================
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false }
+});
+
+// Test database connection (untuk debugging)
+pool.query('SELECT NOW()', (err, res) => {
+    if (err) {
+        console.error('❌ Database connection failed:', err.message);
+    } else {
+        console.log('✅ Database connected successfully at', res.rows[0].now);
+    }
 });
 
 // ============================================================
@@ -155,8 +177,6 @@ async function calculateDWPNeed(floorId, ageDays, totalBirds, estimatedWaterLite
 // ============================================================
 // API ROUTES
 // ============================================================
-app.get('/api/health', (req, res) => res.json({ status: 'OK', timestamp: new Date().toISOString() }));
-
 app.get('/api/users/public', async (req, res) => {
     const { role } = req.query;
     let query = 'SELECT id, name, role FROM users WHERE active = true';
@@ -429,4 +449,22 @@ app.get('/api/admin/global-stats', auth, async (req, res) => {
     res.json({ totalFarms: parseInt(totalFarms.rows[0].count), totalBarns: parseInt(totalBarns.rows[0].count), totalUsers: parseInt(totalUsers.rows[0].count), totalReports: parseInt(totalReports.rows[0].count), avgRisk: parseFloat(avgRisk.rows[0].avg) || 0, topRisks: topRisks.rows });
 });
 
-app.listen(PORT, () => console.log(`🚀 BroilerOS Backend running on port ${PORT}`));
+// ============================================================
+// GLOBAL ERROR HANDLER (PENANGKAP ERROR TERAKHIR)
+// ============================================================
+app.use((err, req, res, next) => {
+    console.error('❌ Global error handler:', err.stack);
+    res.status(500).json({ error: 'Internal Server Error', message: err.message });
+});
+
+// ============================================================
+// START SERVER (UNTUK RENDER)
+// ============================================================
+app.listen(PORT, () => {
+    console.log(`🚀 BroilerOS Backend running on port ${PORT}`);
+    console.log(`🔒 Security: Helmet, CORS, Rate Limit enabled`);
+    console.log(`📡 Environment: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`✅ Health check: http://localhost:${PORT}/api/health`);
+});
+
+module.exports = app;
