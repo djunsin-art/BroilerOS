@@ -1,3 +1,6 @@
+// ============================================================
+// BROILEROS BACKEND - MINIMAL VERSION (PASTI JALAN)
+// ============================================================
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -11,9 +14,9 @@ app.use(cors());
 app.use(express.json());
 
 // ============================================================
-// KONEKSI DATABASE (TANPA CRASH)
+// KONEKSI DATABASE (TETAP JALAN WALAUPUN GAGAL)
 // ============================================================
-console.log('🔌 Connecting to database...');
+console.log('🔌 Mencoba koneksi ke database...');
 
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
@@ -23,23 +26,25 @@ const pool = new Pool({
 
 pool.connect((err, client, release) => {
     if (err) {
-        console.error('❌ DB connection error:', err.message);
-        console.log('⚠️ Server tetap berjalan tanpa DB.');
+        console.error('❌ Database connection failed:', err.message);
+        console.log('⚠️ Server tetap berjalan tanpa database.');
     } else {
-        console.log('✅ DB connected.');
+        console.log('✅ Database connected successfully.');
         release();
     }
 });
 
-pool.on('error', (err) => console.error('DB error:', err.message));
+pool.on('error', (err) => {
+    console.error('❌ Database error:', err.message);
+});
 
 // ============================================================
-// ROUTES (PASTIKAN INI ADA)
+// ROUTES (PASTIKAN SEMUA ADA)
 // ============================================================
 
 // 1. PING - test server hidup
 app.get('/ping', (req, res) => {
-    res.json({ status: 'OK', message: 'Server is running!' });
+    res.json({ status: 'OK', message: 'Server is running!', timestamp: new Date().toISOString() });
 });
 
 // 2. TEST DB - test koneksi database
@@ -52,22 +57,31 @@ app.get('/test-db', async (req, res) => {
     }
 });
 
-// 3. ADMIN SETUP - buat Super Admin
+// 3. HEALTH - health check standar
+app.get('/api/health', (req, res) => {
+    res.json({ status: 'OK', timestamp: new Date().toISOString() });
+});
+
+// 4. ADMIN SETUP - buat Super Admin (SEDERHANA)
 app.post('/api/admin/setup', async (req, res) => {
     const { name, pin, farmName } = req.body;
     if (!name || !pin) {
         return res.status(400).json({ error: 'Name dan PIN wajib' });
     }
-    // Sementara kita hanya kirim respons sukses (tanpa bcrypt dulu untuk testing)
-    res.json({ message: 'Setup received! (DB not yet implemented)' });
+    // Sementara hanya return sukses (untuk testing)
+    res.json({ 
+        message: 'Setup received!', 
+        data: { name, pin, farmName: farmName || 'Hemita Farm' } 
+    });
 });
 
 // ============================================================
-// START SERVER
+// START SERVER (PASTIKAN '0.0.0.0')
 // ============================================================
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`🚀 BroilerOS Backend running on port ${PORT}`);
     console.log(`📡 /ping - test server`);
     console.log(`📡 /test-db - test database`);
+    console.log(`📡 /api/health - health check`);
     console.log(`📡 /api/admin/setup - create admin`);
 });
