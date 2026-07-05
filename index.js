@@ -460,7 +460,7 @@ app.use((err, req, res, next) => {
 // ============================================================
 // START SERVER (UNTUK RENDER)
 // ============================================================
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 BroilerOS Backend running on port ${PORT}`);
     console.log(`🔒 Security: Helmet, CORS, Rate Limit enabled`);
     console.log(`📡 Environment: ${process.env.NODE_ENV || 'development'}`);
