@@ -29,6 +29,7 @@ const allowedOrigins = [
     'https://broileros-app.pages.dev',
     'http://localhost:5173',
     'https://broileros.onrender.com'
+    'https://*.workers.dev', // <-- Tambahkan ini
 ];
 app.use(cors({
     origin: function (origin, callback) {
