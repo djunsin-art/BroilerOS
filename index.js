@@ -90,7 +90,7 @@ app.get('/api/admin/global-stats', auth, async (req, res) => {
 // SECURITY
 app.use(helmet());
 const allowedOrigins = [
-    'https://broileros-app.pages.dev',
+    'https://broileros.pages.dev',
     'http://localhost:5173',
     'http://localhost:3000',
     'https://broileros.onrender.com'
