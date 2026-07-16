@@ -132,7 +132,8 @@ function publicUser(row, farmName) {
         email: row.email || null,
         phone_number: row.phone_number || null,
         farm_name: farmName || 'Farm',
-        is_super_admin: row.is_super_admin || false
+        is_super_admin: row.is_super_admin || false,
+        is_client_admin: row.is_client_admin || false
     };
 }
 
@@ -326,7 +327,7 @@ async function auth(req, res, next) {
         const token = authHeader.split(' ')[1];
         const decoded = jwt.verify(token, JWT_SECRET);
         const result = await pool.query(
-            'SELECT id, name, role, farm_id, barn_id, floor_id, is_super_admin FROM users WHERE id = $1 AND active = true',
+            'SELECT id, name, role, farm_id, barn_id, floor_id, is_super_admin, is_client_admin FROM users WHERE id = $1 AND active = true',
             [decoded.id]
         );
         if (result.rows.length === 0) {
@@ -334,6 +335,7 @@ async function auth(req, res, next) {
         }
         req.user = result.rows[0];
         req.isSuperAdmin = req.user.is_super_admin || false;
+        req.isClientAdmin = req.user.is_client_admin || false;
         next();
     } catch (e) {
         res.status(401).json({ error: 'Invalid token' });
@@ -348,6 +350,16 @@ function requireManager(req, res, next) {
 function requireSuperAdmin(req, res, next) {
     if (req.isSuperAdmin) return next();
     return res.status(403).json({ error: 'Akses khusus Super Admin' });
+}
+
+// Beda dari requireSuperAdmin: TIDAK butuh SUPER_ADMIN_KEY (barrier itu cuma
+// dicek sekali saat login is_super_admin, bukan per-request). Client Admin
+// login normal seperti Manager/Supervisor/Operator biasa, cukup flag
+// is_client_admin=true di baris user-nya yang membuka endpoint di bawah.
+// is_super_admin otomatis lolos juga (superset akses).
+function requireClientAdmin(req, res, next) {
+    if (req.isSuperAdmin || req.isClientAdmin) return next();
+    return res.status(403).json({ error: 'Akses khusus Client Admin' });
 }
 
 // ============================================================
@@ -567,6 +579,101 @@ app.post('/api/admin/create-client', auth, requireSuperAdmin, async (req, res) =
         res.status(500).json({ error: 'Gagal membuat client baru', detail: err.message });
     } finally {
         client.release();
+    }
+});
+
+// ============================================================
+// ONBOARDING CLIENT BARU (Client Admin) - versi ringan create-client
+// ============================================================
+// Reuse persis logika /api/admin/create-client di atas (validasi, transaksi
+// atomic farm+Manager, error handling client_code duplikat) — bedanya cuma
+// middleware: requireClientAdmin, bukan requireSuperAdmin. Sengaja endpoint
+// terpisah (bukan menambah requireClientAdmin ke endpoint lama) supaya kalau
+// nanti field/validasi 2 alur ini perlu beda, tidak saling mengganggu.
+app.post('/api/admin/create-client-basic', auth, requireClientAdmin, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const { farmName, clientCode, ownerName, picName, picPhone, address, managerName, managerPin, managerEmail, managerPhone } = req.body;
+        if (!farmName || !clientCode || !managerName || !managerPin) {
+            client.release();
+            return res.status(400).json({ error: 'farmName, clientCode, managerName, dan managerPin wajib diisi' });
+        }
+        const code = clientCode.toUpperCase().trim();
+        if (!code.match(/^[A-Z0-9]{3,30}$/)) {
+            client.release();
+            return res.status(400).json({ error: 'Kode client hanya boleh huruf besar/angka, 3-30 karakter' });
+        }
+        if (!managerPin.match(/^[0-9]{4,6}$/)) {
+            client.release();
+            return res.status(400).json({ error: 'PIN Manager harus 4-6 digit angka' });
+        }
+        if (managerEmail && !managerEmail.match(/^[^\s@]+@[^\s@]+\.[^\s@]+$/)) {
+            client.release();
+            return res.status(400).json({ error: 'Format email tidak valid' });
+        }
+        if (managerPhone && !managerPhone.match(/^(\+62|62|0)8[0-9]{7,12}$/)) {
+            client.release();
+            return res.status(400).json({ error: 'Format nomor telepon tidak valid' });
+        }
+        if (picPhone && !picPhone.match(/^(\+62|62|0)8[0-9]{7,12}$/)) {
+            client.release();
+            return res.status(400).json({ error: 'Format nomor telepon PIC tidak valid' });
+        }
+
+        await client.query('BEGIN');
+        const farmRes = await client.query(
+            `INSERT INTO farms (name, owner_name, client_code, address, pic_name, pic_phone)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             RETURNING id, name, client_code, address, pic_name, pic_phone, status`,
+            [farmName, ownerName || managerName, code, address || null, picName || null, picPhone || null]
+        );
+        const farm = farmRes.rows[0];
+
+        const hash = await bcrypt.hash(managerPin, 10);
+        const managerRes = await client.query(`
+            INSERT INTO users (name, pin_hash, role, farm_id, email, phone_number)
+            VALUES ($1, $2, 'manager', $3, $4, $5)
+            RETURNING id, name, role, email, phone_number
+        `, [managerName, hash, farm.id, managerEmail || null, managerPhone || null]);
+
+        await client.query('COMMIT');
+        res.status(201).json({
+            farm,
+            manager: { ...managerRes.rows[0], role: capRole(managerRes.rows[0].role) }
+        });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        if (err.code === '23505') {
+            return res.status(409).json({ error: 'Kode client sudah dipakai, pilih kode lain' });
+        }
+        console.error('create-client-basic error:', err);
+        res.status(500).json({ error: 'Gagal membuat client baru', detail: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// Ringkasan client untuk Client Admin — SENGAJA hanya kolom administratif
+// (lokasi, PIC, status, jumlah kandang, populasi AGREGAT per farm). TIDAK
+// menyertakan risk_score/telemetry per-lantai/mortalitas harian — itu tetap
+// hanya lewat endpoint operasional yang sudah dilindungi ownership guard.
+app.get('/api/admin/clients-summary', auth, requireClientAdmin, async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT
+                f.id, f.name, f.client_code, f.address, f.pic_name, f.pic_phone, f.status, f.created_at,
+                COUNT(DISTINCT b.id) AS total_kandang,
+                COALESCE(SUM(fl.default_population), 0) AS total_populasi_kapasitas
+            FROM farms f
+            LEFT JOIN barns b ON b.farm_id = f.id
+            LEFT JOIN floors fl ON fl.barn_id = b.id
+            GROUP BY f.id
+            ORDER BY f.name
+        `);
+        res.json(result.rows);
+    } catch (err) {
+        console.error('clients-summary error:', err);
+        res.status(500).json({ error: 'Gagal mengambil ringkasan client', detail: err.message });
     }
 });
 
