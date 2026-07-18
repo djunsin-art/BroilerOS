@@ -21,23 +21,37 @@
  * (this file) get bumped together — see VERSION below.
  *
  * ---------------------------------------------------------------------------
- * INTEGRATION (BroilerOS backend, Node/Express + pg):
+ * INTEGRATION (BroilerOS backend index.js — confirmed against your actual
+ * file, not a generic guess):
+ *
+ * Your file defines `pool`, `auth`, `requireSuperAdmin` around lines 40-363,
+ * BEFORE the first route (`app.get('/', ...)` at line 368). Add these two
+ * lines right after `requireClientAdmin` is defined (~line 363) and before
+ * that first route:
  *
  *   const { createRiskRouter } = require('./risk-engine');
- *   app.use('/api', createRiskRouter({ pool }));   // pool = your existing pg Pool
+ *   app.use('/api', createRiskRouter({ pool, auth, requireSuperAdmin }));
  *
- * This adds two endpoints:
- *   POST /api/risk/calculate        — for paid tenants (existing auth/ownership
- *                                      middleware should wrap this route same
- *                                      as your other /api/floors, /api/barns
- *                                      routes; not duplicated here since your
- *                                      auth pattern isn't in this file)
- *   POST /api/dwp99/trial/telemetry — for DWP-99 trial/lead ingestion, writes
- *                                      into the isolated dwp99_trial schema
- *                                      (see neon-dwp99-trial-schema.sql).
- *                                      Deliberately NOT behind tenant
- *                                      ownership guards — these rows are not
- *                                      tenant data.
+ * Do NOT wrap this app.use() call in `auth` itself (e.g. don't write
+ * `app.use('/api', auth, createRiskRouter(...))`) — that would force auth on
+ * EVERY route this router defines, including the public DWP-99 trial
+ * endpoint below, which must stay unauthenticated. Each route inside this
+ * file applies its own middleware individually instead, exactly like the
+ * rest of your index.js does (e.g. `app.post('/api/water/predict', auth,
+ * ...)`), not like a blanket `app.use(prefix, middleware, router)`.
+ *
+ * This adds three endpoints:
+ *   POST /api/risk/calculate        — auth required (any logged-in tenant
+ *                                      user). Stateless calculation, no
+ *                                      floorId, so no ownership check needed.
+ *   POST /api/dwp99/trial/telemetry — public, no auth (DWP-99 field installs
+ *                                      have no JWT). Rate-limited instead,
+ *                                      same pattern as your enumerationLimiter.
+ *                                      Writes into the isolated dwp99_trial
+ *                                      schema (see neon-dwp99-trial-schema.sql)
+ *                                      — never the tenant tables.
+ *   GET  /api/dwp99/trial/leads     — auth + requireSuperAdmin, same gate as
+ *                                      your existing /api/admin/clients.
  * ---------------------------------------------------------------------------
  */
 
@@ -170,18 +184,46 @@ function evaluate({ ageDays, population, temperature, humidity, mortality, windS
 // ----------------------------------------------------------------------------
 // EXPRESS ROUTER
 // ----------------------------------------------------------------------------
-function createRiskRouter({ pool }) {
+function createRiskRouter({ pool, auth, requireSuperAdmin }) {
+  if (typeof auth !== 'function' || typeof requireSuperAdmin !== 'function') {
+    throw new Error(
+      'createRiskRouter requires { pool, auth, requireSuperAdmin } — pass your ' +
+      'existing auth and requireSuperAdmin middleware from index.js, not new ones.'
+    );
+  }
+
   const express = require('express');
+  const rateLimitPkg = require('express-rate-limit');
+  const rateLimit = rateLimitPkg.rateLimit || rateLimitPkg; // supports both v6/v7 (default export) and v8 (named export)
+  const ipKeyGenerator = rateLimitPkg.ipKeyGenerator; // v8+ only; undefined on older installs, handled below
   const router = express.Router();
+
+  // Same shape as index.js's enumerationLimiter — this endpoint is public
+  // (DWP-99 trial devices have no JWT/login), so it needs its own throttle
+  // instead of `auth` to stop abuse.
+  //
+  // NOTE: index.js's own enumerationLimiter uses `req.headers['cf-connecting-ip']
+  // || req.ip` as its keyGenerator. If your installed express-rate-limit is
+  // v7+, that exact pattern throws/warns ERR_ERL_KEY_GEN_IPV6 (an IPv6 address
+  // can be written multiple equivalent ways, so using it raw as a key lets
+  // someone bypass the limit by varying the representation) — worth checking
+  // that on enumerationLimiter too, not just here. This route uses the
+  // library's own ipKeyGenerator() to normalize when available.
+  const trialTelemetryLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 60, // one DWP-99 install reports a handful of times a day; 60/15min is generous headroom, not a real ceiling
+    keyGenerator: (req) => req.headers['cf-connecting-ip'] || (ipKeyGenerator ? ipKeyGenerator(req.ip) : req.ip),
+    message: { error: 'Terlalu banyak permintaan. Coba lagi dalam 15 menit.' },
+  });
 
   /**
    * POST /api/risk/calculate
-   * Paid-tenant use. Wrap this route with your existing auth + ownership
-   * guard middleware where you mount it (same pattern as your other
-   * /api/floors/:id and /api/barns/:id routes) — this file intentionally
-   * does not assume your auth middleware's shape.
+   * Paid-tenant use. `auth` is index.js's own middleware — any logged-in
+   * user (Operator/Supervisor/Manager) may call this; it's a stateless
+   * calculation with no floorId, so no verifyFloorOwnership check applies
+   * (nothing tenant-specific is read or written).
    */
-  router.post('/risk/calculate', (req, res) => {
+  router.post('/risk/calculate', auth, (req, res) => {
     try {
       const result = evaluate(req.body || {});
       res.json(result);
@@ -192,15 +234,12 @@ function createRiskRouter({ pool }) {
 
   /**
    * POST /api/dwp99/trial/telemetry
-   * DWP-99 trial/lead ingestion. NOT behind tenant ownership guards — these
-   * rows belong to the isolated dwp99_trial schema, never the tenant tables.
-   * Body: { leadId, deviceId, bi, fi, unitLabel, ageDays, population,
-   *         temperature, humidity, mortality, windSpeed, waterLiters, feedKg,
-   *         recordedAt }
-   * leadId is optional on first call — if absent, a new lead row is created
-   * from deviceId (see neon-dwp99-trial-schema.sql for the upsert contract).
+   * DWP-99 trial/lead ingestion. Deliberately NOT behind `auth` — DWP-99
+   * field installs are not BroilerOS tenant users and have no JWT to send.
+   * Protected instead by trialTelemetryLimiter, same spirit as index.js's
+   * enumerationLimiter on other public endpoints (/api/clients/resolve etc.)
    */
-  router.post('/dwp99/trial/telemetry', async (req, res) => {
+  router.post('/dwp99/trial/telemetry', trialTelemetryLimiter, async (req, res) => {
     const b = req.body || {};
     if (!b.deviceId) {
       return res.status(400).json({ error: 'missing_device_id' });
@@ -257,10 +296,9 @@ function createRiskRouter({ pool }) {
    * Powers the "Prospek DWP-99" panel in BroilerOS's Global Monitor. Reads
    * from the dwp99_trial.lead_readiness view (see
    * neon-dwp99-trial-schema.sql) — ungraduated leads only, ranked by report
-   * volume. Wrap this route with your super-admin/client-admin auth
-   * middleware where you mount it, same as /api/admin/*.
+   * volume. Gated to Super Admin, same as /api/admin/clients.
    */
-  router.get('/dwp99/trial/leads', async (req, res) => {
+  router.get('/dwp99/trial/leads', auth, requireSuperAdmin, async (req, res) => {
     try {
       const result = await pool.query(
         `SELECT id, device_id, display_name, phone_number, farm_label,
