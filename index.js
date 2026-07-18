@@ -76,6 +76,7 @@ const allowedOrigins = [
     'http://localhost:5173',
     'http://localhost:3000',
     'https://broileros-app.onrender.com'
+    'null'  // <-- DWP-99 dibuka sebagai file lokal (file://) di tablet, browser mengirim origin "null"
 ];
 app.use(cors({
     origin: function (origin, callback) {
