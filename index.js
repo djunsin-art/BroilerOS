@@ -52,9 +52,6 @@ const pool = new Pool({
     connectionTimeoutMillis: 10000,
 });
 
-const { createRiskRouter } = require('./risk-engine');
-app.use('/api', createRiskRouter({ pool }));
-
 pool.connect((err, client, release) => {
     if (err) {
         console.error('❌ Database connection failed:', err.message || err);
