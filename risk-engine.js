@@ -314,6 +314,11 @@ function createRiskRouter({ pool, auth, requireSuperAdmin }) {
    * field installs are not BroilerOS tenant users and have no JWT to send.
    * Protected instead by trialTelemetryLimiter, same spirit as index.js's
    * enumerationLimiter on other public endpoints (/api/clients/resolve etc.)
+   *
+   * v3.6.0 fase 2: menerima culling/afkir/panenBertahap, farmCode, dan
+   * history (audit trail) juga — lihat neon-migration-003-teknis-audit.sql.
+   * Semuanya opsional/backward-compatible: device versi lama yang belum
+   * mengirim field ini tetap diterima normal (COALESCE ke 0/NULL).
    */
   router.post('/dwp99/trial/telemetry', trialTelemetryLimiter, async (req, res) => {
     const b = req.body || {};
@@ -329,26 +334,28 @@ function createRiskRouter({ pool, auth, requireSuperAdmin }) {
 
         // Ensure a lead row exists for this device (idempotent).
         const leadRes = await client.query(
-          `INSERT INTO dwp99_trial.leads (device_id, display_name, phone_number, farm_label, first_seen_at, last_seen_at)
-           VALUES ($1, $2, $3, $4, now(), now())
+          `INSERT INTO dwp99_trial.leads (device_id, display_name, phone_number, farm_label, farm_code, first_seen_at, last_seen_at)
+           VALUES ($1, $2, $3, $4, $5, now(), now())
            ON CONFLICT (device_id)
            DO UPDATE SET last_seen_at = now(),
                          display_name = COALESCE(EXCLUDED.display_name, dwp99_trial.leads.display_name),
-                         phone_number = COALESCE(EXCLUDED.phone_number, dwp99_trial.leads.phone_number)
+                         phone_number = COALESCE(EXCLUDED.phone_number, dwp99_trial.leads.phone_number),
+                         farm_code = COALESCE(EXCLUDED.farm_code, dwp99_trial.leads.farm_code)
            RETURNING id`,
-          [b.deviceId, b.displayName || null, b.phoneNumber || null, b.farmLabel || null]
+          [b.deviceId, b.displayName || null, b.phoneNumber || null, b.farmLabel || null, b.farmCode || null]
         );
         const leadId = leadRes.rows[0].id;
 
         await client.query(
           `INSERT INTO dwp99_trial.trial_records
              (lead_id, unit_label, age_days, population, temperature, humidity, mortality, wind_speed,
-              water_liters, feed_kg, body_weight, thi, thi_zone, risk_score, risk_level, risk_breakdown,
-              engine_version, recorded_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17, COALESCE($18, now()))`,
+              water_liters, feed_kg, body_weight, culling, afkir, panen_bertahap, history, thi, thi_zone,
+              risk_score, risk_level, risk_breakdown, engine_version, recorded_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21, COALESCE($22, now()))`,
           [
             leadId, b.unitLabel || null, b.ageDays || 0, b.population || 0, b.temperature, b.humidity,
             b.mortality || 0, b.windSpeed ?? 2, b.waterLiters || 0, b.feedKg || 0, b.bodyWeight || null,
+            b.culling || 0, b.afkir || 0, b.panenBertahap || 0, b.history ? JSON.stringify(b.history) : null,
             result.thi, result.thiZone, result.risk, result.riskLevel,
             JSON.stringify(result.breakdown), result.engineVersion, b.recordedAt || null,
           ]
@@ -356,6 +363,63 @@ function createRiskRouter({ pool, auth, requireSuperAdmin }) {
 
         await client.query('COMMIT');
         res.json({ ok: true, leadId, ...result });
+      } catch (e) {
+        await client.query('ROLLBACK');
+        throw e;
+      } finally {
+        client.release();
+      }
+    } catch (e) {
+      res.status(500).json({ error: 'server_error', message: e.message });
+    }
+  });
+
+  /**
+   * POST /api/dwp99/trial/teknis
+   * Kategori data baru (v3.6.0 fase 2) — pengaturan Teknis harian
+   * (ventilasi/suhu/cooling) dari layar Supervisor DWP-99. Sama seperti
+   * /dwp99/trial/telemetry: publik + rate-limited, bukan behind `auth`,
+   * karena device trial tidak punya JWT. Tidak menyentuh evaluate() —
+   * data ini murni disimpan, tidak dipakai untuk skor risiko backend.
+   */
+  router.post('/dwp99/trial/teknis', trialTelemetryLimiter, async (req, res) => {
+    const b = req.body || {};
+    if (!b.deviceId) {
+      return res.status(400).json({ error: 'missing_device_id' });
+    }
+    try {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+
+        const leadRes = await client.query(
+          `INSERT INTO dwp99_trial.leads (device_id, display_name, phone_number, farm_label, farm_code, first_seen_at, last_seen_at)
+           VALUES ($1, $2, $3, $4, $5, now(), now())
+           ON CONFLICT (device_id)
+           DO UPDATE SET last_seen_at = now(),
+                         display_name = COALESCE(EXCLUDED.display_name, dwp99_trial.leads.display_name),
+                         phone_number = COALESCE(EXCLUDED.phone_number, dwp99_trial.leads.phone_number),
+                         farm_code = COALESCE(EXCLUDED.farm_code, dwp99_trial.leads.farm_code)
+           RETURNING id`,
+          [b.deviceId, b.displayName || null, b.phoneNumber || null, b.farmLabel || null, b.farmCode || null]
+        );
+        const leadId = leadRes.rows[0].id;
+
+        await client.query(
+          `INSERT INTO dwp99_trial.tek_records
+             (lead_id, unit_label, age_days, fan_active, fan_total, set_temp, wind_target,
+              cooling_pad, inlet, heater, water_pump, notes, history, recorded_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13, COALESCE($14, now()))`,
+          [
+            leadId, b.unitLabel || null, b.ageDays || 0, b.fanActive ?? null, b.fanTotal ?? null,
+            b.setTemp ?? null, b.windTarget ?? null, b.coolingPad || null, b.inlet || null,
+            b.heater || null, b.waterPump || null, b.notes || null,
+            b.history ? JSON.stringify(b.history) : null, b.recordedAt || null,
+          ]
+        );
+
+        await client.query('COMMIT');
+        res.json({ ok: true, leadId });
       } catch (e) {
         await client.query('ROLLBACK');
         throw e;
@@ -376,6 +440,14 @@ function createRiskRouter({ pool, auth, requireSuperAdmin }) {
    */
   router.get('/dwp99/trial/leads', auth, requireSuperAdmin, async (req, res) => {
     try {
+      // NOTE: lead_readiness is a VIEW defined in neon-dwp99-trial-schema.sql
+      // (migration 001), which this file doesn't have visibility into — so
+      // farm_code is deliberately NOT added to the view query below (that
+      // would break if the view doesn't already pass that column through).
+      // Instead it's fetched from `leads` directly (schema known, added by
+      // migration 003) and merged here. If you'd rather have the view itself
+      // expose farm_code, that's a small edit to lead_readiness's CREATE VIEW
+      // statement — outside what this file can safely change blind.
       const result = await pool.query(
         `SELECT id, device_id, display_name, phone_number, farm_label,
                 first_seen_at, last_seen_at, total_reports, high_risk_reports,
@@ -384,6 +456,16 @@ function createRiskRouter({ pool, auth, requireSuperAdmin }) {
          ORDER BY total_reports DESC
          LIMIT 200`
       );
+      const ids = result.rows.map(r => r.id);
+      let codeById = {};
+      if (ids.length) {
+        const codes = await pool.query(
+          `SELECT id, farm_code FROM dwp99_trial.leads WHERE id = ANY($1)`,
+          [ids]
+        );
+        codeById = Object.fromEntries(codes.rows.map(r => [r.id, r.farm_code]));
+      }
+      result.rows = result.rows.map(r => ({ ...r, farm_code: codeById[r.id] || null }));
       res.json({ leads: result.rows });
     } catch (e) {
       res.status(500).json({ error: 'server_error', message: e.message });
