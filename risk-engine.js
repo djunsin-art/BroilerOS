@@ -61,7 +61,7 @@
 
 'use strict';
 
-const VERSION = '2.0.0'; // v2.0.0: clinical 5-category model recovered from DWP-99 v3.0 — see below
+const VERSION = '2.1.0'; // v2.1.0: added POST /dwp99/trial/signup for landing-page pre-install signup (see dwp99_trial.landing_signups); v2.0.0: clinical 5-category model recovered from DWP-99 v3.0 — see below
 
 // ----------------------------------------------------------------------------
 // TEMPERATURE-HUMIDITY ZONES (age-dependent)
@@ -292,6 +292,13 @@ function createRiskRouter({ pool, auth, requireSuperAdmin }) {
     message: { error: 'Terlalu banyak permintaan. Coba lagi dalam 15 menit.' },
   });
 
+  const signupLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 20, // satu orang wajar submit sekali; ini jaga-jaga dari spam/bot, bukan batas normal
+    keyGenerator: (req) => req.headers['cf-connecting-ip'] || (ipKeyGenerator ? ipKeyGenerator(req.ip) : req.ip),
+    message: { error: 'Terlalu banyak permintaan. Coba lagi dalam 15 menit.' },
+  });
+
   /**
    * POST /api/risk/calculate
    * Paid-tenant use. `auth` is index.js's own middleware — any logged-in
@@ -467,6 +474,33 @@ function createRiskRouter({ pool, auth, requireSuperAdmin }) {
       }
       result.rows = result.rows.map(r => ({ ...r, farm_code: codeById[r.id] || null }));
       res.json({ leads: result.rows });
+    } catch (e) {
+      res.status(500).json({ error: 'server_error', message: e.message });
+    }
+  });
+
+  /**
+   * POST /api/dwp99/trial/signup
+   * Landing page pre-install signup (dwp99-landing.html). Deliberately NOT
+   * behind `auth` — sama seperti /dwp99/trial/telemetry, ini bukan tenant
+   * user berautentikasi. Beda dari /dwp99/trial/telemetry: belum ada
+   * deviceId di titik ini (orang belum install), jadi disimpan terpisah di
+   * dwp99_trial.landing_signups (lihat neon-migration-005-landing-signups.sql),
+   * dikorelasikan manual ke dwp99_trial.leads lewat nomor whatsapp kalau
+   * perlu nanti.
+   */
+  router.post('/dwp99/trial/signup', signupLimiter, async (req, res) => {
+    const b = req.body || {};
+    if (!b.whatsapp || String(b.whatsapp).replace(/\D/g, '').length < 9) {
+      return res.status(400).json({ error: 'invalid_whatsapp' });
+    }
+    try {
+      await pool.query(
+        `INSERT INTO dwp99_trial.landing_signups (name, whatsapp, ownership_status)
+         VALUES ($1, $2, $3)`,
+        [b.name || null, b.whatsapp, b.ownershipStatus || null]
+      );
+      res.json({ ok: true });
     } catch (e) {
       res.status(500).json({ error: 'server_error', message: e.message });
     }
