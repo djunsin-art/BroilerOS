@@ -73,6 +73,7 @@ app.use(helmet());
 
 const allowedOrigins = [
     'https://broileros.pages.dev',
+    'https://dwp99.pages.dev',  // <-- DITAMBAHKAN: DWP-99 di-hosting di domain terpisah dari BroilerOS (lihat DOWNLOAD_URL di dwp99-landing.html) — origin ini belum pernah masuk whitelist, itu sebab semua "Not allowed by CORS" di log
     'http://localhost:5173',
     'http://localhost:3000',
     'https://broileros-app.onrender.com',
