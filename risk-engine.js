@@ -377,6 +377,13 @@ function createRiskRouter({ pool, auth, requireSuperAdmin }) {
         client.release();
       }
     } catch (e) {
+      // FIX: sebelumnya error asli (mis. tabel/kolom belum ada, koneksi pool
+      // gagal, constraint violation) TIDAK PERNAH masuk log server — hanya
+      // dikirim ke client sebagai JSON, yang tidak ditampilkan detail di
+      // DWP-99 (cuma jadi status "Belum Sinkron"/merah). Ini sebab log Render
+      // tetap kosong walau pengiriman data tetap gagal. Sekarang error asli
+      // dicatat supaya kegagalan berikutnya benar-benar terlihat di log.
+      console.error('[dwp99/trial/telemetry] gagal:', e.message, e.stack);
       res.status(500).json({ error: 'server_error', message: e.message });
     }
   });
@@ -434,6 +441,7 @@ function createRiskRouter({ pool, auth, requireSuperAdmin }) {
         client.release();
       }
     } catch (e) {
+      console.error('[dwp99/trial/teknis] gagal:', e.message, e.stack);
       res.status(500).json({ error: 'server_error', message: e.message });
     }
   });
@@ -475,6 +483,7 @@ function createRiskRouter({ pool, auth, requireSuperAdmin }) {
       result.rows = result.rows.map(r => ({ ...r, farm_code: codeById[r.id] || null }));
       res.json({ leads: result.rows });
     } catch (e) {
+      console.error('[dwp99/trial/leads] gagal:', e.message, e.stack);
       res.status(500).json({ error: 'server_error', message: e.message });
     }
   });
@@ -502,6 +511,7 @@ function createRiskRouter({ pool, auth, requireSuperAdmin }) {
       );
       res.json({ ok: true });
     } catch (e) {
+      console.error('[dwp99/trial/signup] gagal:', e.message, e.stack);
       res.status(500).json({ error: 'server_error', message: e.message });
     }
   });
