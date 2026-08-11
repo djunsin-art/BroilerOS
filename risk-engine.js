@@ -369,6 +369,7 @@ function createRiskRouter({ pool, auth, requireSuperAdmin }) {
         );
 
         await client.query('COMMIT');
+        console.log(`[dwp99/trial/telemetry] OK: unit=${b.unitLabel} age=${b.ageDays} farm=${b.farmCode} leadId=${leadId}`);
         res.json({ ok: true, leadId, ...result });
       } catch (e) {
         await client.query('ROLLBACK');
@@ -433,6 +434,7 @@ function createRiskRouter({ pool, auth, requireSuperAdmin }) {
         );
 
         await client.query('COMMIT');
+        console.log(`[dwp99/trial/teknis] OK: unit=${b.unitLabel} age=${b.ageDays} farm=${b.farmCode} leadId=${leadId}`);
         res.json({ ok: true, leadId });
       } catch (e) {
         await client.query('ROLLBACK');
