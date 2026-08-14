@@ -61,7 +61,7 @@
 
 'use strict';
 
-const VERSION = '2.1.0'; // v2.1.0: added POST /dwp99/trial/signup for landing-page pre-install signup (see dwp99_trial.landing_signups); v2.0.0: clinical 5-category model recovered from DWP-99 v3.0 — see below
+const VERSION = '2.2.0'; // v2.2.0: added POST /dwp99/trial/farm-register + POST /dwp99/trial/farm-latest — cross-device READ sync gated by Manager PIN hash (see neon-migration-006-farm-access.sql); v2.1.0: added POST /dwp99/trial/signup for landing-page pre-install signup (see dwp99_trial.landing_signups); v2.0.0: clinical 5-category model recovered from DWP-99 v3.0 — see below
 
 // ----------------------------------------------------------------------------
 // TEMPERATURE-HUMIDITY ZONES (age-dependent)
@@ -514,6 +514,113 @@ function createRiskRouter({ pool, auth, requireSuperAdmin }) {
       res.json({ ok: true });
     } catch (e) {
       console.error('[dwp99/trial/signup] gagal:', e.message, e.stack);
+      res.status(500).json({ error: 'server_error', message: e.message });
+    }
+  });
+
+  /**
+   * POST /api/dwp99/trial/farm-register
+   * v2.2.0 — Bagian dari fitur sinkronisasi BACA lintas-gadget (sebelumnya
+   * jalur ini cuma satu arah: kirim saja, tidak ada yang baca balik — lihat
+   * catatan di farm-latest di bawah). Dipanggil OTOMATIS oleh device Manager
+   * begitu PIN Manager lokal berhasil diverifikasi (tidak perlu aksi manual
+   * apapun dari user — sengaja begitu, supaya tidak ada "faktor lupa").
+   * Menyimpan pinHash+pinSalt Manager itu (BUKAN PIN aslinya — device hanya
+   * pernah menghitung hash lokal, PIN mentah tidak pernah dikirim ke mana
+   * pun, sama seperti pola hashing PIN yang sudah dipakai di seluruh app
+   * client-side) sebagai kunci akses baca utk farmCode itu. INSERT ON
+   * CONFLICT supaya Manager yang ganti PIN otomatis meng-update kunci akses
+   * ini juga di kunjungan berikutnya — tidak pernah macet di PIN lama.
+   */
+  router.post('/dwp99/trial/farm-register', trialTelemetryLimiter, async (req, res) => {
+    const b = req.body || {};
+    if (!b.farmCode || !b.pinHash || !b.pinSalt) {
+      return res.status(400).json({ error: 'missing_fields' });
+    }
+    try {
+      await pool.query(
+        `INSERT INTO dwp99_trial.farm_access (farm_code, pin_hash, pin_salt, registered_by, updated_at)
+         VALUES ($1, $2, $3, $4, now())
+         ON CONFLICT (farm_code)
+         DO UPDATE SET pin_hash = EXCLUDED.pin_hash, pin_salt = EXCLUDED.pin_salt,
+                       registered_by = EXCLUDED.registered_by, updated_at = now()`,
+        [b.farmCode, b.pinHash, b.pinSalt, b.deviceId || null]
+      );
+      res.json({ ok: true });
+    } catch (e) {
+      console.error('[dwp99/trial/farm-register] gagal:', e.message, e.stack);
+      res.status(500).json({ error: 'server_error', message: e.message });
+    }
+  });
+
+  /**
+   * POST /api/dwp99/trial/farm-latest
+   * v2.2.0 — Jalur BACA lintas-gadget. Sebelum ini, dwp99_trial hanya jalur
+   * TULIS satu arah (analitik lead-tracking Hemita Farm-Tech sendiri) — TIDAK
+   * ADA cara satu device DWP-99 membaca data device LAIN untuk farm yang
+   * sama, itu sebab Manager/Supervisor di gadget berbeda tidak pernah saling
+   * lihat data walau pengiriman berjalan normal. Endpoint ini yang menutup
+   * celah itu: mengembalikan laporan TERBARU per unit (lantai/kandang) utk
+   * satu farmCode, dari SEMUA device yang pernah kirim data farm itu.
+   *
+   * Wajib pinHash+pinSalt yang PERSIS SAMA dengan yang terdaftar lewat
+   * farm-register — jadi cuma device yang benar-benar tahu PIN Manager farm
+   * itu (dibuktikan lewat hash, bukan farmCode semata — farmCode sendiri
+   * bukan rahasia ketat, muncul di banyak tempat di app termasuk QR export)
+   * yang bisa menarik data farm itu. Tidak menyimpan histori/riwayat penuh
+   * di sini — device yang meminta cukup diberi status TERBARU tiap unit,
+   * riwayat detail tetap tanggung jawab masing-masing device secara lokal.
+   */
+  const farmLatestLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 60, // wajar dipanggil otomatis tiap beberapa menit oleh 1 device Manager; bukan endpoint publik massal
+    keyGenerator: (req) => req.headers['cf-connecting-ip'] || (ipKeyGenerator ? ipKeyGenerator(req.ip) : req.ip),
+    message: { error: 'Terlalu banyak permintaan. Coba lagi dalam 15 menit.' },
+  });
+  router.post('/dwp99/trial/farm-latest', farmLatestLimiter, async (req, res) => {
+    const b = req.body || {};
+    if (!b.farmCode || !b.pinHash || !b.pinSalt) {
+      return res.status(400).json({ error: 'missing_fields' });
+    }
+    try {
+      const access = await pool.query(
+        `SELECT pin_hash, pin_salt FROM dwp99_trial.farm_access WHERE farm_code = $1`,
+        [b.farmCode]
+      );
+      if (!access.rows.length) {
+        return res.status(404).json({ error: 'farm_not_registered' });
+      }
+      const row = access.rows[0];
+      if (row.pin_hash !== b.pinHash || row.pin_salt !== b.pinSalt) {
+        return res.status(403).json({ error: 'pin_mismatch' });
+      }
+
+      const telemetry = await pool.query(
+        `SELECT DISTINCT ON (tr.unit_label)
+                tr.unit_label, tr.age_days, tr.population, tr.temperature, tr.humidity,
+                tr.mortality, tr.wind_speed, tr.water_liters, tr.feed_kg, tr.body_weight,
+                tr.culling, tr.afkir, tr.panen_bertahap, tr.risk_score, tr.risk_level, tr.recorded_at
+         FROM dwp99_trial.trial_records tr
+         JOIN dwp99_trial.leads l ON l.id = tr.lead_id
+         WHERE l.farm_code = $1
+         ORDER BY tr.unit_label, tr.recorded_at DESC
+         LIMIT 50`,
+        [b.farmCode]
+      );
+      const teknis = await pool.query(
+        `SELECT DISTINCT ON (tk.unit_label)
+                tk.unit_label, tk.age_days, tk.fan_active, tk.fan_total, tk.set_temp, tk.wind_target,
+                tk.cooling_pad, tk.inlet, tk.heater, tk.water_pump, tk.recorded_at
+         FROM dwp99_trial.tek_records tk
+         JOIN dwp99_trial.leads l ON l.id = tk.lead_id
+         WHERE l.farm_code = $1
+         ORDER BY tk.unit_label, tk.recorded_at DESC
+         LIMIT 50`,
+        [b.farmCode]
+      );
+      res.json({ telemetry: telemetry.rows, teknis: teknis.rows });
+    } catch (e) {
+      console.error('[dwp99/trial/farm-latest] gagal:', e.message, e.stack);
       res.status(500).json({ error: 'server_error', message: e.message });
     }
   });
